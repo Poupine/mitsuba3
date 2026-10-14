@@ -1602,6 +1602,96 @@ def test05_postprocess(variants_all_ad_rgb, integrator_name):
     dr.backward(dr.sum(image.array))
     assert dr.allclose(dr.grad(params[key]), 2 * radiance * pixels)
 
+
+def test06_direct_projective_directional_emitter(variants_all_ad_rgb):
+    """Ensure direct_projective preserves si_fg.wi when evaluating emitters on indirect silhouettes."""
+    if mi.is_polarized:
+        pytest.skip('Test must be adapted to polarized rendering.')
+
+    class DirectionalAreaEmitter(mi.Emitter):
+        def __init__(self, props):
+            super().__init__(props)
+            self.m_flags = mi.EmitterFlags.Surface
+
+        def eval(self, si, active=True):
+            cos_theta = mi.Frame3f.cos_theta(si.wi)
+            val = dr.select(cos_theta > 0.0, cos_theta * (1.0 - cos_theta), 0.0)
+            return mi.Spectrum(val) & active
+
+        def sample_direction(self, it, sample, active=True):
+            ds = self.get_shape().sample_direction(it, sample, active)
+            si = dr.zeros(mi.SurfaceInteraction3f)
+            si.wi = mi.Vector3f(0.0, 0.0, -dr.dot(ds.n, ds.d))
+            val = self.eval(si, active & (ds.pdf > 0.0))
+            return ds, dr.select(ds.pdf > 0.0, val / ds.pdf, 0.0)
+
+        def pdf_direction(self, it, ds, active=True):
+            return self.get_shape().pdf_direction(it, ds, active)
+
+        def bbox(self):
+            return self.get_shape().bbox()
+
+    mi.register_emitter('directional_area', lambda props: DirectionalAreaEmitter(props))
+
+    scene = mi.load_dict({
+        'type': 'scene',
+        'plane': {
+            'type': 'rectangle',
+            'bsdf': {'type': 'diffuse'},
+        },
+        'light': {
+            'type': 'disk',
+            'to_world': T().translate([0.5, 0.0, 1.0]) @ T().rotate([0, 1, 0], 180) @ T().scale(0.4),
+            'emitter': {'type': 'directional_area'},
+        },
+        'sensor': {
+            'type': 'perspective',
+            'to_world': T().look_at(origin=[0, 0, 4], target=[0, 0, 0], up=[0, 1, 0]),
+            'film': {
+                'type': 'hdrfilm',
+                'width': 16,
+                'height': 16,
+                'sample_border': True,
+                'rfilter': {'type': 'box'},
+            },
+        },
+    })
+
+    params = mi.traverse(scene)
+    key = 'light.to_world'
+    init_trafo = mi.Transform4f(params[key])
+
+    imgs_fwd = {}
+    grads_bwd = {}
+    for name in ['direct_projective', 'prb_projective']:
+        integ = mi.load_dict({
+            'type': name,
+            'max_depth': 2,
+            'sppc': 0,
+            'sppp': 0,
+            'sppi': 256,
+            'guiding': 'none',
+        })
+        theta = mi.Float(0.0)
+        dr.enable_grad(theta)
+        params[key] = mi.Transform4f().translate([theta, 0.0, 0.0]) @ init_trafo
+        params.update()
+        dr.forward(theta, dr.ADFlag.ClearEdges)
+        imgs_fwd[name] = dr.detach(integ.render_forward(scene, seed=0, spp=256, params=theta))
+
+        theta = mi.Float(0.0)
+        dr.enable_grad(theta)
+        params[key] = mi.Transform4f().translate([theta, 0.0, 0.0]) @ init_trafo
+        params.update()
+        grad_in = dr.ones(mi.TensorXf, imgs_fwd[name].shape)
+        integ.render_backward(scene, grad_in=grad_in, seed=0, spp=256, params=theta)
+        grads_bwd[name] = dr.grad(theta)
+
+    assert dr.max(dr.abs(imgs_fwd['direct_projective'])) > 5e-3
+    assert dr.allclose(imgs_fwd['direct_projective'], imgs_fwd['prb_projective'], atol=1e-5)
+    assert dr.abs(grads_bwd['direct_projective']) > 1e-2
+    assert dr.allclose(grads_bwd['direct_projective'], grads_bwd['prb_projective'], atol=1e-4)
+
 # -------------------------------------------------------------------
 #                      Generate reference images
 # -------------------------------------------------------------------

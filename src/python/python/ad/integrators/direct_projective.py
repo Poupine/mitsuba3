@@ -278,98 +278,70 @@ class DirectProjectiveIntegrator(PSIntegrator):
 
 
     def sample_radiance_difference(self, scene, ss, curr_depth, sampler, wavelengths, active):
+        # ----------- Estimate the radiance of the background -----------
+        ray_bg = ss.spawn_ray(wavelengths)
+
         if curr_depth == 1:
-
-            # ----------- Estimate the radiance of the background -----------
-
             # The ray passes through null surfaces like a BSDF-sampled ray
-            ray_bg = ss.spawn_ray(wavelengths)
             si_bg, tr_bg = scene.ray_intersect_tr(ray_bg, active=active)
             radiance_bg = tr_bg * si_bg.emitter(scene).eval(si_bg, active)
-
-            # ----------- Estimate the radiance of the foreground -----------
-
-            # For direct illumination integrators, only an area emitter can
-            # contribute here. In order to get its contribution, we must create
-            # a valid surface interaction object.
-            pi_fg = dr.zeros(mi.PreliminaryIntersection3f)
-            pi_fg.valid = active
-            pi_fg.t = 1
-            pi_fg.prim_index = ss.prim_index
-            pi_fg.prim_uv = ss.uv
-            pi_fg.shape = ss.shape
-
-            # Create a dummy ray that we never perform ray-intersection with to
-            # compute other fields in ``si``
-            dummy_ray = mi.Ray3f(ss.p - ss.d, ss.d)
-            ray_bg.wavelengths = wavelengths
-
-            # The ray origin is wrong, but this is fine if we only need the primal
-            # radiance
-            si_fg = scene.compute_surface_interaction(
-                dummy_ray, pi_fg, mi.RayFlags.Default, active)
-
-            # We know the incident direction is valid since this is the
-            # foreground interaction. Overwrite the incident direction to avoid
-            # potential issues introduced by smooth normals.
-            si_fg.wi = mi.Vector3f(0, 0, 1)
-            radiance_fg = ss.shape.emitter().eval(si_fg, active)
         elif curr_depth == 0:
-
-            # ----------- Estimate the radiance of the background -----------
-            ray_bg = ss.spawn_ray(wavelengths)
             radiance_bg, _, _, _ = self.sample(
                 dr.ADMode.Primal, scene, sampler, ray_bg, curr_depth, None, None, active, False, None)
+        else:
+            raise Exception(f"Unexpected depth {curr_depth} in direct projective integrator")
 
-            # ----------- Estimate the radiance of the foreground -----------
-            # Create a preliminary intersection point
-            pi_fg = dr.zeros(mi.PreliminaryIntersection3f)
-            pi_fg.valid = active
-            pi_fg.t = 1
-            pi_fg.prim_index = ss.prim_index
-            pi_fg.prim_uv = ss.uv
-            pi_fg.shape = ss.shape
+        # ----------- Estimate the radiance of the foreground -----------
+        # Create a preliminary intersection point
+        pi_fg = dr.zeros(mi.PreliminaryIntersection3f)
+        pi_fg.valid = active
+        pi_fg.t = 1
+        pi_fg.prim_index = ss.prim_index
+        pi_fg.prim_uv = ss.uv
+        pi_fg.shape = ss.shape
 
-            # Create a dummy ray that we never perform ray-intersection with to
-            # compute other fields in ``si``
-            dummy_ray = mi.Ray3f(ss.p - ss.d, ss.d)
-            dummy_ray.wavelengths = wavelengths
+        # Create a dummy ray that we never perform ray-intersection with to
+        # compute other fields in ``si``
+        dummy_ray = mi.Ray3f(ss.p - ss.d, ss.d)
+        dummy_ray.wavelengths = wavelengths
 
-            # The ray origin is wrong, but this is fine if we only need the primal
-            # radiance
-            si_fg = scene.compute_surface_interaction(
-                dummy_ray, pi_fg, mi.RayFlags.Default, active)
+        # The ray origin is wrong, but this is fine if we only need the primal
+        # radiance
+        si_fg = scene.compute_surface_interaction(
+            dummy_ray, pi_fg, mi.RayFlags.Default, active)
 
-            # If smooth normals are used, it is possible that the computed
-            # shading normal near visibility silhouette points to the wrong side
-            # of the surface. We fix this by clamping the shading frame normal
-            # to the visible side.
-            alpha = dr.dot(si_fg.sh_frame.n, ss.d)
-            eps = dr.epsilon(alpha) * 100
-            wrong_side = active & (alpha > -eps)
+        # If smooth normals are used, it is possible that the computed
+        # shading normal near visibility silhouette points to the wrong side
+        # of the surface. We fix this by clamping the shading frame normal
+        # to the visible side.
+        alpha = dr.dot(si_fg.sh_frame.n, ss.d)
+        eps = dr.epsilon(alpha) * 100
+        wrong_side = active & (alpha > -eps)
 
-            # NOTE: In the following case, (1) a single sided BSDF is used,
-            # (2) the silhouette sample is on an open boundary like an open
-            # edge, and (3) we actually hit the back side of the surface,
-            # the expected radiance is zero because no BSDF is defiend on
-            # that side. But this shading frame correction will mistakenly
-            # produce a non-zero radiance. Please use two-sided BSDFs if
-            # this is a concern.
+        # NOTE: In the following case, (1) a single sided BSDF is used,
+        # (2) the silhouette sample is on an open boundary like an open
+        # edge, and (3) we actually hit the back side of the surface,
+        # the expected radiance is zero because no BSDF is defiend on
+        # that side. But this shading frame correction will mistakenly
+        # produce a non-zero radiance. Please use two-sided BSDFs if
+        # this is a concern.
 
-            # Remove the component of the shading frame normal that points to
-            # the wrong side
-            new_sh_normal = dr.normalize(
-                si_fg.sh_frame.n - (alpha + eps) * ss.d)
-            # `si_fg` surgery
-            si_fg.sh_frame[wrong_side] = mi.Frame3f(new_sh_normal)
-            si_fg.wi[wrong_side] = si_fg.to_local(-ss.d)
+        # Remove the component of the shading frame normal that points to
+        # the wrong side
+        new_sh_normal = dr.normalize(
+            si_fg.sh_frame.n - (alpha + eps) * ss.d)
+        # `si_fg` surgery
+        si_fg.sh_frame[wrong_side] = mi.Frame3f(new_sh_normal)
+        si_fg.wi[wrong_side] = si_fg.to_local(-ss.d)
 
+        if curr_depth == 1:
+            # For direct illumination integrators, only an area emitter can
+            # contribute here.
+            radiance_fg = ss.shape.emitter().eval(si_fg, active)
+        else:
             # Estimate the radiance starting from the surface interaction
             radiance_fg, _, _, _ = self.sample(
                 dr.ADMode.Primal, scene, sampler, ray_bg, curr_depth, None, None, active, False, si_fg)
-
-        else:
-            raise Exception(f"Unexpected depth {curr_depth} in direct projective integrator")
 
         # Compute the radiance difference
         radiance_diff = radiance_fg - radiance_bg
