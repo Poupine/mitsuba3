@@ -824,6 +824,9 @@ public:
             active = true;
 
         Point2f uv = m_transform * si.uv;
+        if (filtered())
+            return uv_grad(filtered_grad(si, uv, active));
+
         BilinearWeights bw = bilinear_weights(uv);
         const Point2f &w0 = bw.w0, &w1 = bw.w1;
 
@@ -865,12 +868,7 @@ public:
         // Partials w.r.t. the transformed coordinates
         Vector2f df_st = resolution() * df_xy;
 
-        // Partials w.r.t. u and v (include uv transform by transpose multiply)
-        const auto &tm = m_transform.matrix;
-        return Vector2f{ dr::fmadd(tm.entry(0, 0),  df_st.x(),
-                                   tm.entry(1, 0) * df_st.y()),
-                         dr::fmadd(tm.entry(0, 1),  df_st.x(),
-                                   tm.entry(1, 1) * df_st.y()) };
+        return uv_grad(df_st);
     }
 
     Color3f eval_3(const SurfaceInteraction3f &si,
@@ -1114,6 +1112,114 @@ protected:
         const Matrix2f &m = si.footprint;
         return { m_transform * Vector2f(m(0, 0), m(1, 0)),
                  m_transform * Vector2f(m(0, 1), m(1, 1)) };
+    }
+
+    /// Map partials w.r.t. the transformed coordinates to partials w.r.t. u
+    /// and v (i.e., multiply by the transpose of the UV transform)
+    Vector2f uv_grad(const Vector2f &df_st) const {
+        const auto &tm = m_transform.matrix;
+        return Vector2f{ dr::fmadd(tm.entry(0, 0),  df_st.x(),
+                                   tm.entry(1, 0) * df_st.y()),
+                         dr::fmadd(tm.entry(0, 1),  df_st.x(),
+                                   tm.entry(1, 1) * df_st.y()) };
+    }
+
+    /**
+     * Partials of a filtered \ref eval_1() lookup w.r.t. the transformed
+     * coordinates
+     *
+     * Averages the partials of the trilinear taps of ``eval_filtered()``. The
+     * footprint analysis (level of detail, tap count, and major axis) mirrors
+     * ``drjit::detail::tex_eval_filtered()`` and must remain in sync with it.
+     */
+    Vector2f filtered_grad(const SurfaceInteraction3f &si, const Point2f &uv,
+                           Mask active) const {
+        auto [ddx, ddy] = footprint(si);
+        ScalarVector2f res(resolution());
+        Vector2f dx = ddx * res,
+                 dy = ddy * res;
+        Float px2   = dr::squared_norm(dx),
+              py2   = dr::squared_norm(dy),
+              pxy   = dr::dot(dx, dy),
+              mid   = .5f * (px2 + py2),
+              half  = .5f * (px2 - py2),
+              disc  = dr::sqrt(dr::fmadd(half, half, pxy * pxy)),
+              p_max = dr::sqrt(mid + disc),
+              p_min = dr::sqrt(dr::maximum(mid - disc, 0.f));
+
+        uint32_t n_levels  = (uint32_t) m_texture.mip_levels(),
+                 max_aniso = (uint32_t) m_texture.max_aniso();
+        Float lod = dr::log2(dr::maximum(
+            dr::maximum(p_min, p_max * ScalarFloat(1.0 / max_aniso)), 1e-30f));
+        lod = dr::clip(lod, 0.f, ScalarFloat(n_levels - 1));
+
+        Float cover = p_max * dr::exp2(-lod),
+              n     = dr::clip(dr::ceil(dr::fmadd(cover, -1e-5f, cover)), 1.f,
+                               ScalarFloat(max_aniso)),
+              inv_n = dr::rcp(n);
+
+        // Taps step along the major ellipse axis
+        Mask x_major = px2 >= py2;
+        Float ca    = dr::select(x_major, disc + half, pxy),
+              cb    = dr::select(x_major, pxy, disc - half),
+              scale = p_max * dr::rcp(dr::maximum(
+                          dr::norm(dr::fmadd(ca, dx, cb * dy)), 1e-30f));
+        Vector2f major = dr::fmadd(ca, ddx, cb * ddy) * scale;
+
+        // Each tap blends the two MIP levels enclosing the level of detail
+        Int32 l0 = dr::floor2int<Int32>(lod),
+              l1 = dr::minimum(l0 + 1, (int32_t) n_levels - 1);
+        Float frac = lod - Float(l0);
+
+        Vector2f df_st = dr::zeros<Vector2f>();
+        for (uint32_t k = 0; k < max_aniso; ++k) {
+            Mask m = active && (Float(k) < n);
+            Point2f p = dr::fmadd(major, dr::fmadd(k + .5f, inv_n, -.5f), uv);
+            Vector2f g0 = level_grad(p, l0, m),
+                     g1 = level_grad(p, l1, m && (frac > 0.f));
+            df_st += dr::select(m, dr::fmadd(g1 - g0, frac, g0), 0.f);
+        }
+
+        return df_st * inv_n;
+    }
+
+    /**
+     * Partials of a bilinear \ref eval_1() lookup of MIP level ``level``
+     * w.r.t. the transformed coordinates
+     *
+     * Matches the level-zero computation of \ref eval_1_grad(), except that
+     * the four texels are looked up at their centers via ``eval_lod()``.
+     */
+    Vector2f level_grad(const Point2f &uv, const Int32 &level,
+                        Mask active) const {
+        if (dr::none_or<false>(active))
+            return dr::zeros<Vector2f>();
+
+        Vector2f res(dr::maximum(Vector2i(resolution()) >> level, 1));
+        Point2f p  = dr::fmadd(uv, res, -.5f),
+                i  = dr::floor(p),
+                w1 = p - i,
+                w0 = 1.f - w1;
+
+        // Texels in the corner order of eval_fetch(), i.e. k = x + 2y
+        Float lod(level), f[4];
+        for (uint32_t k = 0; k < 4; ++k) {
+            Point2f c = (i + Point2f(ScalarFloat(k & 1) + .5f,
+                                     ScalarFloat(k >> 1) + .5f)) / res;
+            if (m_texture.channel_count() == 1)
+                f[k] = m_texture.template eval_lod<dr::Array<Float, 1>>(
+                    c, lod, active).x();
+            else if (m_texture.channel_count() == 2)
+                f[k] = luminance(reconstruct_normal(
+                    m_texture.template eval_lod<Vector2f>(c, lod, active)));
+            else
+                f[k] = luminance(
+                    m_texture.template eval_lod<Color3f>(c, lod, active));
+        }
+
+        return res * Vector2f(
+            dr::fmadd(w0.y(), f[1] - f[0], w1.y() * (f[3] - f[2])),
+            dr::fmadd(w0.x(), f[2] - f[0], w1.x() * (f[3] - f[1])));
     }
 
     /**

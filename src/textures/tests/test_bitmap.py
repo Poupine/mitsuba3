@@ -410,6 +410,7 @@ def test13_filtered_lookup(variants_all_backends_once, filter_type):
     # Without a footprint, the lookup samples the finest level
     si.uv = mi.Point2f(0.3, 0.7)
     assert dr.allclose(tex.eval_3(si), ref.eval_3(si), atol=1e-5)
+    assert dr.allclose(tex.eval_1_grad(si), ref.eval_1_grad(si), atol=1e-5)
 
     # A footprint of 1/8 selects the 8x8 level, i.e. the mean of a block
     si.uv = mi.Point2f(2.5 / 8, 5.5 / 8)
@@ -417,6 +418,13 @@ def test13_filtered_lookup(variants_all_backends_once, filter_type):
     block = values[40:48, 16:24].mean(axis=(0, 1))
     assert dr.allclose(tex.eval_3(si), mi.Color3f(block), atol=1e-4)
     assert dr.allclose(tex.eval_1(si), mi.luminance(mi.Color3f(block)), atol=1e-4)
+
+    # The gradient is that of a bilinear lookup of this level
+    coarse = mi.Bitmap(values.reshape(8, 8, 8, 8, 3).mean(axis=(1, 3)))
+    ref_coarse = mi.load_dict({'type': 'bitmap', 'raw': True, 'wrap_mode': 'clamp',
+                               'bitmap': coarse})
+    si.uv = mi.Point2f(0.3, 0.7)
+    assert dr.allclose(tex.eval_1_grad(si), ref_coarse.eval_1_grad(si), atol=1e-3)
 
     # A footprint covering the whole texture yields its mean
     si.footprint = mi.Matrix2f([[2, 0], [0, 2]])
@@ -511,3 +519,63 @@ def test15_forward_ad_spectral(variants_all_ad_spectral):
                    np.array(make(0.5 - eps).eval(si))).ravel() / (2 * eps)
 
     dr.assert_allclose(dr.grad(value), finite_diff, atol=1e-3)
+
+
+@pytest.mark.parametrize('filter_type', ['trilinear', 'anisotropic'])
+@pytest.mark.parametrize('channels', [1, 3])
+def test16_filtered_eval_grad(variant_scalar_rgb, filter_type, channels):
+    """eval_1_grad() respects the ray cone footprint across MIP levels,
+    anisotropic taps, and to_uv transforms."""
+    import numpy as np
+    rng = np.random.default_rng(0)
+    values = rng.random((32, 32, channels), dtype=np.float32)
+
+    transform = (mi.ScalarTransform4f().translate([0.5, 0.5, 0]) @
+                 mi.ScalarTransform4f().rotate([0, 0, 1], 25).scale([1.4, 0.9, 1]) @
+                 mi.ScalarTransform4f().translate([-0.5, -0.5, 0]))
+    tex = mi.load_dict({'type': 'bitmap', 'raw': True, 'to_uv': transform,
+                        'wrap_mode': 'repeat', 'filter_type': filter_type,
+                        'bitmap': mi.Bitmap(values)})
+
+    delta = 1e-4
+    for footprint in [mi.Matrix2f([[1 / 8, 0], [0, 1 / 8]]),
+                      mi.Matrix2f([[1.5 / 8, 0], [0, 1.5 / 8]]),
+                      mi.Matrix2f([[1 / 4, 0.03], [-0.02, 1 / 16]])]:
+        si = mi.SurfaceInteraction3f()
+        si.footprint = footprint
+        for uv in [(0.32, 0.44), (0.63, 0.29)]:
+            def eval_at(du, dv):
+                si.uv = mi.Point2f(uv[0] + du, uv[1] + dv)
+                return tex.eval_1(si)
+
+            fd = mi.Vector2f((eval_at(delta, 0) - eval_at(-delta, 0)) / (2 * delta),
+                             (eval_at(0, delta) - eval_at(0, -delta)) / (2 * delta))
+            si.uv = mi.Point2f(*uv)
+            grad = tex.eval_1_grad(si)
+            assert dr.all(dr.abs(grad) > 1e-3)
+            assert dr.allclose(grad, fd, rtol=1e-2, atol=1e-3)
+
+
+def test17_filtered_eval_grad_ad(variants_all_ad_rgb):
+    """Derivatives of eval_1_grad() reach the MIP level selected by the
+    footprint"""
+    import numpy as np
+    bmp = mi.Bitmap(np.full((4, 4, 1), 0.5, dtype=np.float32))
+    tex = mi.load_dict({'type': 'bitmap', 'bitmap': bmp, 'raw': True,
+                        'filter_type': 'trilinear'})
+    params = mi.traverse(tex)
+    dr.enable_grad(params['data'])
+    params.update()
+
+    # A footprint of 1/2 selects the 2x2 level
+    si = dr.zeros(mi.SurfaceInteraction3f)
+    si.uv = [0.3, 0.4]
+    si.footprint = mi.Matrix2f([[0.5, 0], [0, 0.5]])
+    grad_uv = tex.eval_1_grad(si)
+    dr.backward(grad_uv.x + grad_uv.y)
+
+    # Each texel of the 2x2 level averages a 2x2 block of the base level,
+    # whose texels thus receive the same derivative
+    g = np.array(dr.grad(params['data']))[..., 0]
+    assert np.any(g != 0)
+    assert np.allclose(g, np.kron(g[::2, ::2], np.ones((2, 2))))
