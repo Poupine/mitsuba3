@@ -824,46 +824,128 @@ public:
             active = true;
 
         Point2f uv = m_transform * si.uv;
-        BilinearWeights bw = bilinear_weights(uv);
-        const Point2f &w0 = bw.w0, &w1 = bw.w1;
 
-        Float f00, f10, f01, f11;
-        if constexpr (Upsample) {
-            dr::Array<Color3f, 4> c = fetch_rgb(bw.i, active);
-            f00 = luminance(c[0]);
-            f10 = luminance(c[1]);
-            f01 = luminance(c[2]);
-            f11 = luminance(c[3]);
-        } else if (channels == 1) {
-            using Data1 = dr::Array<Float, 1>;
-            dr::Array<Data1, 4> c =
-                m_texture.template eval_fetch<Data1>(uv, active);
-            f00 = c[0].x(); f10 = c[1].x();
-            f01 = c[2].x(); f11 = c[3].x();
-        } else if (channels == 2) {
-            dr::Array<Vector2f, 4> c =
-                m_texture.template eval_fetch<Vector2f>(uv, active);
-            f00 = luminance(reconstruct_normal(c[0]));
-            f10 = luminance(reconstruct_normal(c[1]));
-            f01 = luminance(reconstruct_normal(c[2]));
-            f11 = luminance(reconstruct_normal(c[3]));
-        } else { // 3 channels
-            dr::Array<Color3f, 4> c =
-                m_texture.template eval_fetch<Color3f>(uv, active);
-            f00 = luminance(c[0]);
-            f10 = luminance(c[1]);
-            f01 = luminance(c[2]);
-            f11 = luminance(c[3]);
-        }
+        auto eval_level_grad = [&](const Point2f &p, Int32 level, bool use_lod,
+                                   Mask m) -> Vector2f {
+            if (dr::none_or<false>(m))
+                return dr::zeros<Vector2f>();
 
-        // Partials w.r.t. pixel coordinate x and y
-        Vector2f df_xy{
-            dr::fmadd(w0.y(), f10 - f00, w1.y() * (f11 - f01)),
-            dr::fmadd(w0.x(), f01 - f00, w1.x() * (f11 - f10))
+            Vector2i res_i = use_lod
+                ? dr::maximum(Vector2i(resolution()) >> level, 1)
+                : Vector2i(resolution());
+            Vector2f res_f(res_i);
+            BilinearWeights bw = bilinear_weights(p, res_i);
+            const Point2f &w0 = bw.w0, &w1 = bw.w1;
+
+            auto fetch_corners = [&]<typename T>(auto &&to_scalar) {
+                dr::Array<T, 4> c;
+                if (!use_lod) {
+                    c = m_texture.template eval_fetch<T>(p, m);
+                } else {
+                    Float lod(level);
+                    Vector2f inv_res = dr::rcp(res_f);
+                    for (uint32_t k = 0; k < 4; ++k) {
+                        Point2f cp = (Point2f(bw.i) +
+                                      Point2f(ScalarFloat(k & 1) + 0.5f,
+                                              ScalarFloat(k >> 1) + 0.5f)) * inv_res;
+                        c[k] = m_texture.template eval_lod<T>(cp, lod, m);
+                    }
+                }
+                return dr::Array<Float, 4>{ to_scalar(c[0]), to_scalar(c[1]),
+                                            to_scalar(c[2]), to_scalar(c[3]) };
+            };
+
+            dr::Array<Float, 4> f;
+            if constexpr (Upsample) {
+                dr::Array<Color3f, 4> c = fetch_rgb(bw.i, m);
+                f = { luminance(c[0]), luminance(c[1]),
+                      luminance(c[2]), luminance(c[3]) };
+            } else if (channels == 1) {
+                using Data1 = dr::Array<Float, 1>;
+                f = fetch_corners.template operator()<Data1>(
+                    [](const Data1 &v) { return v.x(); });
+            } else if (channels == 2) {
+                f = fetch_corners.template operator()<Vector2f>(
+                    [&](const Vector2f &v) { return luminance(reconstruct_normal(v)); });
+            } else { // 3 channels
+                f = fetch_corners.template operator()<Color3f>(
+                    [](const Color3f &v) { return luminance(v); });
+            }
+
+            // Partials w.r.t. pixel coordinate x and y at this MIP level
+            Vector2f df_xy{
+                dr::fmadd(w0.y(), f[1] - f[0], w1.y() * (f[3] - f[2])),
+                dr::fmadd(w0.x(), f[2] - f[0], w1.x() * (f[3] - f[1]))
+            };
+
+            // Partials w.r.t. the transformed coordinates
+            return res_f * df_xy;
         };
 
-        // Partials w.r.t. the transformed coordinates
-        Vector2f df_st = resolution() * df_xy;
+        Vector2f df_st;
+        if (!filtered()) {
+            df_st = eval_level_grad(uv, 0, false, active);
+        } else if constexpr (!Upsample) {
+            auto [ddx, ddy] = footprint(si);
+            ScalarVector2f res(resolution());
+            Vector2f dx = ddx * res,
+                     dy = ddy * res;
+            Float px2   = dr::squared_norm(dx),
+                  py2   = dr::squared_norm(dy),
+                  pxy   = dr::dot(dx, dy),
+                  mid   = 0.5f * (px2 + py2),
+                  half  = 0.5f * (px2 - py2),
+                  disc  = dr::sqrt(dr::fmadd(half, half, pxy * pxy)),
+                  p_max = dr::sqrt(mid + disc),
+                  p_min = dr::sqrt(dr::maximum(mid - disc, 0.f));
+
+            uint32_t n_levels  = (uint32_t) m_texture.mip_levels(),
+                     max_aniso = (uint32_t) m_texture.max_aniso();
+            Float lod = dr::log2(dr::maximum(
+                dr::maximum(p_min, p_max * ScalarFloat(1.f / max_aniso)), 1e-30f));
+            lod = dr::clip(lod, 0.f, ScalarFloat(n_levels - 1));
+
+            Int32 l0 = dr::floor2int<Int32>(lod),
+                  l1 = dr::minimum(l0 + 1, (int32_t) n_levels - 1);
+            Float frac = lod - Float(l0);
+
+            auto trilinear_grad = [&](const Point2f &p, Mask m) -> Vector2f {
+                Vector2f g0 = eval_level_grad(p, l0, true, m),
+                         g1 = eval_level_grad(p, l1, true, m && (frac > 0.f));
+                return dr::fmadd(g1 - g0, frac, g0);
+            };
+
+            if (max_aniso == 1) {
+                df_st = trilinear_grad(uv, active);
+            } else {
+                Float cover = p_max * dr::exp2(-lod),
+                      n_f   = dr::clip(dr::ceil(dr::fmadd(cover, -1e-5f, cover)),
+                                       1.f, ScalarFloat(max_aniso)),
+                      inv_n = dr::rcp(n_f);
+                UInt32 n = dr::floor2int<UInt32>(n_f);
+
+                Mask x_major = px2 >= py2;
+                Float ca = dr::select(x_major, disc + half, pxy),
+                      cb = dr::select(x_major, pxy, disc - half);
+                Vector2f v = dr::fmadd(ca, dx, cb * dy);
+                Float scale = p_max * dr::rcp(dr::maximum(dr::norm(v), 1e-30f));
+                Vector2f major_uv = dr::fmadd(ca, ddx, cb * ddy) * scale,
+                         step_uv  = major_uv * inv_n;
+
+                df_st = dr::zeros<Vector2f>();
+                for (uint32_t k = 0; k < max_aniso; ++k) {
+                    Mask tap_active = active && (k < n);
+                    if (dr::none_or<false>(tap_active))
+                        break;
+                    Point2f tap = dr::fmadd(step_uv, Float(k) + 0.5f,
+                                            uv - 0.5f * major_uv);
+                    df_st += dr::select(tap_active,
+                                        trilinear_grad(tap, tap_active),
+                                        dr::zeros<Vector2f>());
+                }
+                df_st *= inv_n;
+            }
+        }
 
         // Partials w.r.t. u and v (include uv transform by transpose multiply)
         const auto &tm = m_transform.matrix;
@@ -1096,12 +1178,17 @@ protected:
      * Applies the half-texel shift between the UV and texel-center conventions,
      * then returns the lower-left integer texel and the interpolation weights.
      */
-    BilinearWeights bilinear_weights(const Point2f &uv) const {
-        Point2f p    = dr::fmadd(uv, resolution(), -0.5f);
+    BilinearWeights bilinear_weights(const Point2f &uv,
+                                     const Vector2i &res) const {
+        Point2f p    = dr::fmadd(uv, res, -0.5f);
         Vector2i i   = dr::floor2int<Vector2i>(p);
         Point2f w1   = p - Point2f(i),
                 w0   = 1.f - w1;
         return { i, w0, w1 };
+    }
+
+    BilinearWeights bilinear_weights(const Point2f &uv) const {
+        return bilinear_weights(uv, resolution());
     }
 
     /// Does the texture have a MIP pyramid for filtered lookups?
